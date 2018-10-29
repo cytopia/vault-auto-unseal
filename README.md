@@ -1,0 +1,1 @@
+# vault-auto-unseal
