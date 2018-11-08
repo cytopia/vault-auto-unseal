@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+#
+# MIT License
+# Copyright (c) 2018 cytopia
+# https://github.com/cytopia/vault-auto-unseal
+
+
+# Be picky
+set -e
+set -u
+set -o pipefail
+
+
+# -------------------------------------------------------------------------------------------------
+# Pre-flight check
+# -------------------------------------------------------------------------------------------------
+if [ "${#}" -ne "2" ]; then
+	>&2 echo "Error, Invalid number of arguments."
+	>&2 echo "Usage: vault-auto-unseal <bucket-name> <bucket-region>"
+	exit 1
+fi
+
+
+# -------------------------------------------------------------------------------------------------
+# Inputs
+# -------------------------------------------------------------------------------------------------
+
+###
+### S3 bucket name and region to store lock, shamir unseal keys and the root token
+###
+ARG_S3_BUCKET_NAME="${1}"
+ARG_S3_BUCKET_REGION="${2}"
+
+
+# -------------------------------------------------------------------------------------------------
+# Globals
+# -------------------------------------------------------------------------------------------------
+LOGFILE="/var/log/vault-unseal.log"
+
+S3_URI_LOCK="/initializer.lock"
+S3_URI_KEY1="/shamir-key1"
+S3_URI_KEY2="/shamir-key2"
+S3_URI_KEY3="/shamir-key3"
+S3_URI_KEY4="/shamir-key4"
+S3_URI_KEY5="/shamir-key5"
+S3_URI_RTKN="/root-token"
+
+INIT_CHECK_URI="https://127.0.0.1:8200/v1/sys/init"
+SEAL_CHECK_URI="https://127.0.0.1:8200/v1/sys/seal-status"
+
+# -------------------------------------------------------------------------------------------------
+# Functions
+# -------------------------------------------------------------------------------------------------
+
+###
+### S3 helper to copy a string to a file on S3
+###
+function s3_put() {
+	local data="${1}"
+	local target="${2}"
+
+	if ! echo "${data}" | aws s3 cp - "${target}" --region "${ARG_S3_BUCKET_REGION}" --only-show-errors --no-guess-mime-type; then
+		log "err" "AWS S3 upload failed: ${target}"
+		return 1
+	fi
+}
+
+###
+### S3 helper to get a file on S3 and return its content
+###
+function s3_get() {
+	local target="${1}"
+	local data
+
+	if ! data="$( aws s3 cp "${target}" - --region "${ARG_S3_BUCKET_REGION}" --only-show-errors --no-guess-mime-type )"; then
+		log "err" "AWS S3 download failed: ${target}"
+		return 1
+	fi
+	echo "${data}"
+}
+
+
+###
+### S3 helper to delete files
+###
+function s3_delete() {
+	local uri="${1}"
+
+	if ! aws s3 rm "${uri}" --region "${ARG_S3_BUCKET_REGION}" --quiet; then
+		return 1
+	fi
+}
+
+
+###
+### S3 helper to list files
+###
+function s3_list() {
+	local uri="${1}"
+
+	if ! aws s3 ls "${uri}" --region "${ARG_S3_BUCKET_REGION}"; then
+		return 1
+	fi
+}
+
+
+###
+### Check if Vault has already been initialized before
+###
+function is_initialized() {
+	if curl -sS -k "${INIT_CHECK_URI}" | grep -q 'true'; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+
+###
+### Check if Vault is sealed
+###
+function is_unsealed() {
+	set +e
+	vault status >/dev/null 2>&1;
+	ret="${?}"
+	set -e
+
+	if [ "${ret}" -eq "0" ]; then
+		return 0
+	else
+		return "${ret}"
+	fi
+}
+
+###
+### If the Vault has not yet been initialized. One of the Vault node needs to take care about this.
+### This function handles the logic about electing the node that will be responsible for
+### initialization.
+###
+function is_initializer() {
+	local s3_bucket_name="${1}"
+	local val_rem
+	local val_loc
+
+	# Unique identifier for the lockfile
+	val_rem="$( hostname )-$( date '+%Y-%m-%d-%H-%M-%s' )"
+
+	# If there is no lock file already, add ours
+	if ! s3_list "s3://${s3_bucket_name}${S3_URI_LOCK}" >/dev/null; then
+		log "info" "(ELECT)  Uploading lockfile for election"
+		if ! s3_put "${val_rem}" "s3://${s3_bucket_name}${S3_URI_LOCK}"; then
+			log "err" "Could not upload lockfile to s3://${s3_bucket_name}${S3_URI_LOCK}"
+		fi
+	else
+		# If there is already a lockfile we can return early as we have already lost the election
+		log "info" "(ELECT)  Lockfile already exists by another node"
+
+		# Tell the function caller that this node IS NOT the initializer
+		return 1
+	fi
+
+	# The above upload might cause a race-condition between checking and putting a lockfile.
+	# In order to mitigate this issue we will generally assume that more than one node might have
+	# added its lockfile.
+	# For that we will wait a sane amount of time before downloading the lockfile again
+	# in order to compare if its content (the hostname of a node) matches the hostname of the
+	# current node.
+	# If it does match, it means that the current node has won the initializing-election and will
+	# initialize the Vaul. If it does not match, it means another node has won and will take
+	# care about initialization.
+	sleep 10
+
+	# Download the lockfile
+	if ! val_loc="$( s3_get "s3://${s3_bucket_name}${S3_URI_LOCK}" )"; then
+		log "err" "Init Election: Could not download lockfile from s3://${s3_bucket_name}${S3_URI_LOCK}"
+	fi
+
+	# Compare the content of the lockfile and determine if this node is reposnsible for Vault init
+	if [ "${val_rem}" = "${val_loc}" ]; then
+		# Remove remote artifacts (as it way the current node's lockfile)
+		if ! s3_delete "s3://${s3_bucket_name}${S3_URI_LOCK}"; then
+			log "err" "Init Election: Could not delete lockfile from s3://${s3_bucket_name}${S3_URI_LOCK}"
+		fi
+		# Tell the function caller that this node IS the initializer
+		return 0
+	else
+		# Tell the function caller that this node IS NOT the initializer
+		return 1
+	fi
+}
+
+
+###
+### First time Vault initilization
+###
+### Returns 0 if everything was successful
+### Returns 1 if Vault initialization failed
+### Returns 2 if S3 upload failed
+###
+function init_vault() {
+	local s3_bucket_name="${1}"
+
+	local err=0
+
+	local data
+	local key1
+	local key2
+	local key3
+	local key4
+	local key5
+	local rtkn
+
+	# Initialize the Vault
+	if ! data="$( vault operator init )"; then
+		log "err" "Could not initialize the Vault via 'vault operator init'"
+		return 1
+	fi
+
+	# Extract shamir unseal keys and the root token
+	key1="$( echo "${data}" | grep 'Key 1' | awk -F ':' '{print $2}' | xargs )"
+	key2="$( echo "${data}" | grep 'Key 2' | awk -F ':' '{print $2}' | xargs )"
+	key3="$( echo "${data}" | grep 'Key 3' | awk -F ':' '{print $2}' | xargs )"
+	key4="$( echo "${data}" | grep 'Key 4' | awk -F ':' '{print $2}' | xargs )"
+	key5="$( echo "${data}" | grep 'Key 5' | awk -F ':' '{print $2}' | xargs )"
+	rtkn="$( echo "${data}" | grep 'Initial Root Token' | awk -F ':' '{print $2}' | xargs )"
+
+	# Upload shamir unseal keys and the root token to S3
+	if ! s3_put "${key1}" "s3://${s3_bucket_name}${S3_URI_KEY1}"; then
+		log "err" "Could not upload key1 to s3://${s3_bucket_name}${S3_URI_KEY1}"
+		err=1
+	fi
+	if ! s3_put "${key2}" "s3://${s3_bucket_name}${S3_URI_KEY2}"; then
+		log "err" "Could not upload key2 to s3://${s3_bucket_name}${S3_URI_KEY2}"
+		err=1
+	fi
+	if ! s3_put "${key3}" "s3://${s3_bucket_name}${S3_URI_KEY3}"; then
+		log "err" "Could not upload key3 to s3://${s3_bucket_name}${S3_URI_KEY3}"
+		err=1
+	fi
+	if ! s3_put "${key4}" "s3://${s3_bucket_name}${S3_URI_KEY4}"; then
+		log "err" "Could not upload key4 to s3://${s3_bucket_name}${S3_URI_KEY4}"
+		err=1
+	fi
+	if ! s3_put "${key5}" "s3://${s3_bucket_name}${S3_URI_KEY5}"; then
+		log "err" "Could not upload key5 to s3://${s3_bucket_name}${S3_URI_KEY5}"
+		err=1
+	fi
+	if ! s3_put "${rtkn}" "s3://${s3_bucket_name}${S3_URI_RTKN}"; then
+		log "err" "Could not upload root token to s3://${s3_bucket_name}${S3_URI_RTKN}"
+		err=1
+	fi
+
+	# Upload to S3 failed
+	if [ "${err}" -eq "1" ]; then
+		return 2
+	fi
+
+	# All good
+	return 0
+}
+
+
+###
+### Retrieves the unseal keys from S3 and unseal the Vault
+###
+### In case the Vault was initialized just now (or is in the process of being initialized)
+### by any node, it might take some time for the keys to be uploaded to the given S3 bucket.
+### For that case we will loop a couple of times to see if the content is already present.
+###
+function unseal_vault() {
+	local s3_bucket_name="${1}"
+	local retries="30"  # Retry 30 times to access a file from S3
+	local wait="1"      # Wait 1 second between retries
+	local count=0       # The retry counter
+
+	# We only need three keys to unseal the Vault
+	local key1
+	local key2
+	local key3
+
+	# Get Shamir Unseal key 1
+	count=0
+	while ! s3_list "s3://${s3_bucket_name}${S3_URI_KEY1}" >/dev/null; do
+		count=$(( count + 1 ))
+		if [ "${count}" -ge "${retries}" ]; then
+			log "err" "S3 list operations for key1 exceeded"
+			log "err" "Failed to retrieve unseal key1 from s3://${s3_bucket_name}${S3_URI_KEY1}"
+			log "err" "Aborting script execution"
+			exit 1
+		fi
+		sleep "${wait}"
+	done
+	if ! key1="$( s3_get "s3://${s3_bucket_name}${S3_URI_KEY1}" )"; then
+		log "err" "Could not download key1 from s3://${s3_bucket_name}${S3_URI_KEY1}"
+		log "err" "Aborting script execution"
+		exit 1
+	fi
+
+	# Get Shamir Unseal key 2
+	count=0
+	while ! s3_list "s3://${s3_bucket_name}${S3_URI_KEY2}" >/dev/null; do
+		count=$(( count + 1 ))
+		if [ "${count}" -ge "${retries}" ]; then
+			log "err" "S3 list operations for key2 exceeded"
+			log "err" "Failed to retrieve unseal key2 from s3://${s3_bucket_name}${S3_URI_KEY2}"
+			log "err" "Aborting script execution"
+			exit 1
+		fi
+		sleep "${wait}"
+	done
+	if ! key2="$( s3_get "s3://${s3_bucket_name}${S3_URI_KEY2}" )"; then
+		log "err" "Could not download key2 from s3://${s3_bucket_name}${S3_URI_KEY2}"
+		log "err" "Aborting script execution"
+		exit 1
+	fi
+
+	# Get Shamir Unseal key 3
+	count=0
+	while ! s3_list "s3://${s3_bucket_name}${S3_URI_KEY3}" >/dev/null; do
+		count=$(( count + 1 ))
+		if [ "${count}" -ge "${retries}" ]; then
+			log "err" "S3 list operations for key3 exceeded"
+			log "err" "Failed to retrieve unseal key3 from s3://${s3_bucket_name}${S3_URI_KEY3}"
+			log "err" "Aborting script execution"
+			exit 1
+		fi
+		sleep "${wait}"
+	done
+	if ! key3="$( s3_get "s3://${s3_bucket_name}${S3_URI_KEY3}" )"; then
+		log "err" "Could not download key3 from s3://${s3_bucket_name}${S3_URI_KEY3}"
+		log "err" "Aborting script execution"
+		exit 1
+	fi
+
+	log "info" "(UNSEAL) Unsealing Vault 1/3"
+	if ! vault operator unseal "${key1}" >/dev/null; then
+		log "err" "Could not Use key1 to unseal the Vault"
+		log "err" "Aborting script execution"
+		exit 1
+	fi
+	log "info" "(UNSEAL) Unsealing Vault 2/3"
+	if ! vault operator unseal "${key2}" >/dev/null; then
+		log "err" "Could not Use key2 to unseal the Vault"
+		log "err" "Aborting script execution"
+		exit 1
+	fi
+	log "info" "(UNSEAL) Unsealing Vault 3/3"
+	if ! vault operator unseal "${key3}" >/dev/null; then
+		log "err" "Could not Use key3 to unseal the Vault"
+		log "err" "Aborting script execution"
+		exit 1
+	fi
+}
+
+
+###
+### Logfile wrapper
+### It logs to stdout/stderr and to logfile in order to make sure
+### to catch errors everywhere.
+### Ensure that the logfile location is picked up by Cloudwatch
+###
+function log() {
+	local lvl="${1}"
+	local msg="${2}"
+	local date
+
+	date="$(date '+%Y-%m-%d %H:%M:%S')"
+
+	# Error
+	if [ "${lvl}" = "err" ]; then
+		>&2 echo "${date} (VAULT) [ERROR] ${msg}"
+		if [ -w "${LOGFILE}" ]; then
+			echo "${date} (VAULT) [ERROR] ${msg}" >> "${LOGFILE}"
+		fi
+	# Warning
+	elif [ "${lvl}" = "warn" ]; then
+		>&2 echo "${date} (VAULT) [WARN]  ${msg}"
+		if [ -w "${LOGFILE}" ]; then
+			echo "${date} (VAULT) [WARN]  ${msg}" >> "${LOGFILE}"
+		fi
+	# OK
+	elif [ "${lvl}" = "ok" ]; then
+		echo "${date} (VAULT) [OK]    ${msg}"
+		if [ -w "${LOGFILE}" ]; then
+			echo "${date} (VAULT) [OK]    ${msg}" >> "${LOGFILE}"
+		fi
+	# Info
+	elif [ "${lvl}" = "info" ]; then
+		echo "${date} (VAULT) [INFO]  ${msg}"
+		if [ -w "${LOGFILE}" ]; then
+			echo "${date} (VAULT) [INFO]  ${msg}" >> "${LOGFILE}"
+		fi
+	# Debug
+	elif [ "${lvl}" = "debug" ]; then
+		echo "${date} (VAULT) [DEBUG] ${msg}"
+		if [ -w "${LOGFILE}" ]; then
+			echo "${date} (VAULT) [DEBUG] ${msg}" >> "${LOGFILE}"
+		fi
+	# Unknown
+	else
+		echo "${date} (VAULT) [OTHER] ${msg}"
+		if [ -w "${LOGFILE}" ]; then
+			echo "${date} (VAULT) [OTHER] ${msg}" >> "${LOGFILE}"
+		fi
+	fi
+}
+
+
+# -------------------------------------------------------------------------------------------------
+# Entrypoint
+# -------------------------------------------------------------------------------------------------
+
+###
+### Create Logfile
+###
+if [ ! -f "${LOGFILE}" ]; then
+	# Create log dir if it does not exist
+	if [ ! -d "$( dirname "${LOGFILE}" )" ]; then
+		if ! mkdir -p "$( dirname "${LOGFILE}" )"; then
+			>&2 echo "$(date '+%Y-%m-%d %H:%M:%S') (VAULT) [WARN]  Logging disabled. Cannot create log directory $( dirname "${LOGFILE}" )"
+		fi
+	fi
+	# Create log file
+	if ! touch "${LOGFILE}"; then
+		>&2 echo "$(date '+%Y-%m-%d %H:%M:%S') (VAULT) [WARN]  Logging disabled. Cannot create log file ${LOGFILE}"
+	fi
+fi
+if [ ! -w "${LOGFILE}" ]; then
+	>&2 echo "$(date '+%Y-%m-%d %H:%M:%S') (VAULT) [WARN]  Logging disabled. Log file is not writable: ${LOGFILE}"
+fi
+
+
+
+###
+### Ensure all required binaries are present and in $PATH
+###
+if ! command -v vault >/dev/null 2>&1; then
+	log "err" "'vault' binary not found but required"
+	exit 1
+fi
+if ! command -v aws >/dev/null 2>&1; then
+	log "err" "'aws' binary not found but required"
+	exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+	log "err" "'curl' binary not found but required"
+	exit 1
+fi
+if ! command -v hostname >/dev/null 2>&1; then
+	log "err" "'hostname' binary not found but required"
+	exit 1
+fi
+if ! command -v grep >/dev/null 2>&1; then
+	log "err" "'grep' binary not found but required"
+	exit 1
+fi
+if ! command -v awk >/dev/null 2>&1; then
+	log "err" "'awk' binary not found but required"
+	exit 1
+fi
+if ! command -v xargs >/dev/null 2>&1; then
+	log "err" "'xargs' binary not found but required"
+	exit 1
+fi
+
+
+###
+### Wait until Vault is running
+###
+while ! pidof vault >/dev/null 2>&1; do
+	log "debug" "Waiting for Vault to start"
+	sleep 1
+done
+
+
+###
+### Wait until Vault API is responsive
+###
+while ! curl -sS -k "${INIT_CHECK_URI}" >/dev/null 2>&1; do
+	log "debug" "Waiting for Vault API to bea ready"
+	sleep 1
+done
+while ! curl -sS -k "${SEAL_CHECK_URI}" >/dev/null 2>&1; do
+	log "debug" "Waiting for Vault API to bea ready"
+	sleep 1
+done
+sleep 1
+
+
+
+
+###
+### Vault is already unsealed
+###
+if is_unsealed; then
+	log "ok" "Vault is already unsealed"
+	exit 0
+fi
+
+
+###
+### Initialize the Vault
+###
+if ! is_initialized; then
+	log "info" "Vault is not yet initialized"
+	log "info" "(ELECT)  Checking if $(hostname) is elected to initialize the Vault"
+
+	if ! is_initializer "${ARG_S3_BUCKET_NAME}"; then
+		log "info" "(ELECT)  Election lost"
+	else
+		log "info" "(ELECT)  Election won :-)"
+		log "info" "(INIT)   Initializing the Vault"
+		if ! init_vault "${ARG_S3_BUCKET_NAME}"; then
+			log "err" "(INIT)   Vault initialization failed. Aborting script"
+			exit 1
+		fi
+		log "ok" "Vault successfully initialized"
+	fi
+else
+	log "ok" "Vault is already initialized"
+fi
+
+
+###
+### Unseal the Vault
+###
+log "info" "Vault is not yet unsealed"
+if ! unseal_vault "${ARG_S3_BUCKET_NAME}"; then
+	log "err" "(UNSEAL) Vault unsealing failed. Aborting script"
+	exit 1
+fi
+log "ok" "Vault successfully unsealed"
